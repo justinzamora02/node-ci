@@ -1,0 +1,172 @@
+---
+name: Release
+
+'on':
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version to release in vMAJOR.MINOR.PATCH format
+        required: true
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Release
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+
+    steps:
+      - name: Check out the release commit
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6.1.0
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+
+      - name: Validate release request
+        id: release
+        shell: bash
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          GH_TOKEN: ${{ github.token }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          RUN_ID: ${{ github.run_id }}
+          SERVER_URL: ${{ github.server_url }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -Eeuo pipefail
+
+          version_pattern='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
+          if [[ ! "$VERSION" =~ $version_pattern ]]; then
+            echo "::error title=Invalid version::version must match vMAJOR.MINOR.PATCH without leading zeroes, for example v1.2.3."
+            exit 1
+          fi
+
+          if [[ -z "$DEFAULT_BRANCH" ]]; then
+            echo "::error title=Missing default branch::GitHub did not provide the repository default branch."
+            exit 1
+          fi
+
+          git fetch --no-tags origin \
+            "refs/heads/${DEFAULT_BRANCH}:refs/remotes/origin/${DEFAULT_BRANCH}"
+          commit_sha="$(git rev-parse HEAD)"
+
+          if ! git merge-base --is-ancestor \
+            "$commit_sha" "refs/remotes/origin/${DEFAULT_BRANCH}"; then
+            echo "::error title=Wrong release commit::${commit_sha} is not on the default branch ${DEFAULT_BRANCH}."
+            exit 1
+          fi
+
+          if [[ -n "$(git status --porcelain)" ]]; then
+            echo "::error title=Dirty checkout::The release checkout contains uncommitted changes."
+            exit 1
+          fi
+
+          git fetch --force --tags origin
+          release_state="new"
+          run_url="${SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${RUN_ID}"
+
+          if git show-ref --verify --quiet "refs/tags/${VERSION}"; then
+            if (( RUN_ATTEMPT <= 1 )); then
+              echo "::error title=Version already exists::Immutable tag ${VERSION} already exists. Inspect the existing tag and release; do not move or delete it."
+              exit 1
+            fi
+
+            tag_commit="$(git rev-parse "${VERSION}^{commit}")"
+            tag_message="$(
+              git for-each-ref --format='%(contents)' "refs/tags/${VERSION}"
+            )"
+            if [[ "$tag_commit" != "$commit_sha" ]] ||
+              [[ "$tag_message" != *"GitHub Actions run: ${run_url}"* ]]; then
+              echo "::error title=Version already exists::Immutable tag ${VERSION} was not created for this commit by this workflow run."
+              exit 1
+            fi
+
+            release_state="tagged"
+          fi
+
+          gh auth status
+          release_exists="false"
+          if release_lookup="$(
+            gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${VERSION}" 2>&1
+          )"; then
+            release_exists="true"
+          elif [[ "$release_lookup" != *"HTTP 404"* ]]; then
+            echo "::error title=Release lookup failed::Could not determine whether GitHub release ${VERSION} exists. No tags were changed."
+            exit 1
+          fi
+
+          if [[ "$release_state" == "tagged" ]] &&
+            [[ "$release_exists" == "true" ]]; then
+            release_state="released"
+          elif [[ "$release_state" == "new" ]] &&
+            [[ "$release_exists" == "true" ]]; then
+            echo "::error title=Partial release state::A GitHub release named ${VERSION} exists without its immutable tag. Inspect it before retrying."
+            exit 1
+          fi
+
+          if [[ "$release_state" != "new" ]]; then
+            echo "::notice title=Resuming release::Verified ${VERSION} from this workflow run; state is ${release_state}."
+          fi
+
+          {
+            echo "commit_sha=${commit_sha}"
+            echo "major_tag=${VERSION%%.*}"
+            echo "state=${release_state}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Create and push immutable version tag
+        if: steps.release.outputs.state == 'new'
+        shell: bash
+        env:
+          COMMIT_SHA: ${{ steps.release.outputs.commit_sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -Eeuo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag --annotate "$VERSION" "$COMMIT_SHA" \
+            --message "Release ${VERSION}" \
+            --message "GitHub Actions run: ${RUN_URL}"
+          git push origin "refs/tags/${VERSION}"
+
+      - name: Create GitHub release
+        if: steps.release.outputs.state != 'released'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -Eeuo pipefail
+          gh release create "$VERSION" \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --generate-notes \
+            --title "$VERSION"
+
+      - name: Update stable major tag
+        shell: bash
+        env:
+          COMMIT_SHA: ${{ steps.release.outputs.commit_sha }}
+          MAJOR_TAG: ${{ steps.release.outputs.major_tag }}
+        run: |
+          set -Eeuo pipefail
+
+          if git show-ref --verify --quiet "refs/tags/${MAJOR_TAG}"; then
+            previous="$(git rev-parse "${MAJOR_TAG}^{commit}")"
+          else
+            previous="<new tag>"
+          fi
+
+          echo "Updating stable major tag ${MAJOR_TAG}: ${previous} -> ${COMMIT_SHA}"
+          git tag --force "$MAJOR_TAG" "$COMMIT_SHA"
+          git push --force origin "refs/tags/${MAJOR_TAG}"
+          echo "Stable major tag ${MAJOR_TAG} now points to ${COMMIT_SHA}"

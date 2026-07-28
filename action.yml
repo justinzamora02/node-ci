@@ -1,0 +1,143 @@
+---
+name: Node CI
+description: Install locked Node.js dependencies and run the repository CI command
+
+inputs:
+  node-version-file:
+    description: Path to the Node.js version file
+    required: false
+    default: .nvmrc
+  working-directory:
+    description: Directory containing package.json and its lockfile
+    required: false
+    default: .
+
+runs:
+  using: composite
+  steps:
+    - name: Check out caller repository
+      uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6.1.0
+      with:
+        persist-credentials: false
+
+    - name: Validate package-manager contract
+      id: package-manager
+      shell: bash
+      env:
+        WORKING_DIRECTORY: ${{ inputs.working-directory }}
+      run: |
+        set -Eeuo pipefail
+
+        package_json="${WORKING_DIRECTORY%/}/package.json"
+        if [[ ! -f "$package_json" ]]; then
+          echo "::error title=Missing package.json::No package.json found at ${package_json}."
+          exit 1
+        fi
+
+        if ! package_manager="$(
+          jq --exit-status --raw-output \
+            '.packageManager | select(type == "string" and length > 0)' \
+            "$package_json" 2>/dev/null
+        )"; then
+          echo "::error title=Invalid packageManager::package.json must declare packageManager as an exact version, for example npm@11.4.2."
+          exit 1
+        fi
+
+        semver='(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)'
+        prerelease='(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?'
+        build='(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?'
+        pattern="^([a-z][a-z0-9-]*)@(${semver}${prerelease}${build})$"
+
+        if [[ "$package_manager" =~ $pattern ]]; then
+          manager="${BASH_REMATCH[1]}"
+        else
+          echo "::error title=Invalid packageManager::packageManager must use an exact version such as npm@11.4.2, pnpm@10.14.0, or yarn@4.9.2."
+          exit 1
+        fi
+
+        case "$manager" in
+          npm)
+            lockfile="package-lock.json"
+            ;;
+          pnpm)
+            lockfile="pnpm-lock.yaml"
+            ;;
+          yarn)
+            lockfile="yarn.lock"
+            ;;
+          *)
+            echo "::error title=Unsupported package manager::${manager} is not supported. Use npm, pnpm, or yarn."
+            exit 1
+            ;;
+        esac
+
+        lockfile_path="${WORKING_DIRECTORY%/}/${lockfile}"
+        if [[ ! -f "$lockfile_path" ]]; then
+          echo "::error title=Missing lockfile::${manager} requires ${lockfile} at ${lockfile_path}."
+          exit 1
+        fi
+
+        {
+          echo "manager=${manager}"
+          echo "spec=${package_manager}"
+          echo "lockfile_path=${lockfile_path}"
+        } >> "$GITHUB_OUTPUT"
+
+    - name: Set up Node.js with npm dependency caching
+      if: steps.package-manager.outputs.manager == 'npm'
+      uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38  # v6.5.0
+      with:
+        node-version-file: ${{ inputs.node-version-file }}
+        cache: npm
+        cache-dependency-path: ${{ steps.package-manager.outputs.lockfile_path }}
+
+    - name: Set up Node.js for Corepack
+      if: steps.package-manager.outputs.manager != 'npm'
+      uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38  # v6.5.0
+      with:
+        node-version-file: ${{ inputs.node-version-file }}
+        package-manager-cache: false
+
+    - name: Enable Corepack for pnpm or Yarn
+      if: steps.package-manager.outputs.manager != 'npm'
+      shell: bash
+      env:
+        PACKAGE_MANAGER_SPEC: ${{ steps.package-manager.outputs.spec }}
+      run: |
+        set -Eeuo pipefail
+        corepack enable
+        corepack prepare "$PACKAGE_MANAGER_SPEC" --activate
+
+    - name: Configure pnpm or Yarn dependency caching
+      if: steps.package-manager.outputs.manager != 'npm'
+      uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38  # v6.5.0
+      with:
+        node-version-file: ${{ inputs.node-version-file }}
+        cache: ${{ steps.package-manager.outputs.manager }}
+        cache-dependency-path: ${{ steps.package-manager.outputs.lockfile_path }}
+
+    - name: Install dependencies from the lockfile
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        PACKAGE_MANAGER: ${{ steps.package-manager.outputs.manager }}
+      run: |
+        set -Eeuo pipefail
+        case "$PACKAGE_MANAGER" in
+          npm) npm ci ;;
+          pnpm) pnpm install --frozen-lockfile ;;
+          yarn) yarn install --immutable ;;
+        esac
+
+    - name: Run the repository CI command
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        PACKAGE_MANAGER: ${{ steps.package-manager.outputs.manager }}
+      run: |
+        set -Eeuo pipefail
+        case "$PACKAGE_MANAGER" in
+          npm) npm run ci ;;
+          pnpm) pnpm run ci ;;
+          yarn) yarn run ci ;;
+        esac

@@ -1,0 +1,27 @@
+---
+name: Node CI
+
+'on':
+  pull_request:
+  push:
+    branches:
+      - master
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  node-ci:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Run Node CI
+        uses: justinzamora02/node-ci@v1
+        with:
+          # Remove these overrides to use .nvmrc and the repository root.
+          node-version-file: apps/web/.nvmrc
+          working-directory: apps/web
